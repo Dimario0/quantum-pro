@@ -39,7 +39,6 @@ class QuantEngine:
 
                 if len(df) < 30: return None
 
-                # Базовые Индикаторы
                 df.ta.ema(length=20, append=True)
                 df.ta.ema(length=50, append=True)
                 df.ta.ema(length=200, append=True)
@@ -47,10 +46,7 @@ class QuantEngine:
                 df.ta.bbands(length=20, std=2, append=True)
                 df.ta.atr(length=14, append=True)
                 df.ta.macd(fast=12, slow=26, signal=9, append=True)
-                
-                # Индикатор VWMA 20 (След крупных денег по объему)
                 df.ta.vwma(length=20, append=True)
-                
                 df.fillna(0, inplace=True)
                 return df
                 
@@ -58,7 +54,6 @@ class QuantEngine:
             return None
 
     def fetch_imoex(self, days):
-        """Скрытый радар (Скачивает Индекс Мосбиржи)"""
         try:
             with requests.Session() as session:
                 start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
@@ -76,51 +71,38 @@ class QuantEngine:
             return None
 
     def analyze_context(self, data, imoex_data):
-        """Продвинутая логика хедж-фонда (Мульти-факторная) - Вызов для последнего дня"""
         last = data.iloc[-1]
         imoex_last = imoex_data.iloc[-1] if imoex_data is not None and len(imoex_data) > 0 else None
         return self._calculate_signal_for_row(last, imoex_last, data.columns)
 
     def _calculate_signal_for_row(self, row, imoex_row, columns):
-        """Внутренний метод для расчета сигнала для любой конкретной даты"""
         macd_line = [col for col in columns if col.startswith('MACD_')][0]
         macd_sig = [col for col in columns if col.startswith('MACDs_')][0]
         macd_hist = [col for col in columns if col.startswith('MACDh_')][0]
-        
-        # Динамический поиск VWMA
         vwma_col = [col for col in columns if col.startswith('VWMA')][0]
         vwma = row[vwma_col]
         
-        # 1. Тренд Акции (С защитой от новых акций без истории в 200 дней)
         if 'EMA_200' in row and row['EMA_200'] > 0:
             if row['Close'] > row['EMA_50'] and row['EMA_50'] > row['EMA_200']:
-                trend, t_score = "СИЛЬНЫЙ РОСТ 🐂", 1.0
+                trend, t_score = "СИЛЬНЫЙ РОСТ", 1.0
             elif row['Close'] < row['EMA_50'] and row['EMA_50'] < row['EMA_200']:
-                trend, t_score = "СИЛЬНОЕ ПАДЕНИЕ 🐻", -1.0
+                trend, t_score = "СИЛЬНОЕ ПАДЕНИЕ", -1.0
             else:
-                trend, t_score = "БОКОВИК / ФЛЭТ ⚖️", 0
+                trend, t_score = "БОКОВИК", 0
         else:
             if row['Close'] > row['EMA_50']:
-                trend, t_score = "ЛОКАЛЬНЫЙ РОСТ 🐂", 0.5
+                trend, t_score = "ЛОКАЛЬНЫЙ РОСТ", 0.5
             elif row['Close'] < row['EMA_50']:
-                trend, t_score = "ЛОКАЛЬНОЕ ПАДЕНИЕ 🐻", -0.5
+                trend, t_score = "ЛОКАЛЬНОЕ ПАДЕНИЕ", -0.5
             else:
-                trend, t_score = "БОКОВИК / ФЛЭТ ⚖️", 0
+                trend, t_score = "БОКОВИК", 0
 
-        # 2. VWMA (Что делают крупные фонды?)
-        if row['Close'] > vwma:
-            vwma_status, vwma_score = "ПОКУПАЮТ 🐋", 1.0
-        else:
-            vwma_status, vwma_score = "РАЗДАЮТ ТОЛПЕ 🦈", -1.0
-
-        # 3. Моментум (MACD)
+        vwma_status, vwma_score = ("ПОКУПАЮТ", 1.0) if row['Close'] > vwma else ("РАЗДАЮТ", -1.0)
         mom_score = 1.0 if row[macd_line] > row[macd_sig] and row[macd_hist] > 0 else -1.0
         
-        # 4. Перегретость (RSI)
         rsi = row['RSI_14']
         rsi_score = 0.5 if 40 <= rsi <= 60 else (1.5 if rsi < 35 else -1.5)
 
-        # 5. Глобальный рынок (IMOEX)
         imoex_bullish = None
         imoex_trend = "НЕТ ДАННЫХ"
         if imoex_row is not None:
@@ -131,21 +113,15 @@ class QuantEngine:
                 imoex_trend = "ПАДАЕТ 🔴"
                 imoex_bullish = False
 
-        # Формула ИИ-оценки
         tech_total = (t_score * 0.3) + (mom_score * 0.3) + (vwma_score * 0.3) + (rsi_score * 0.1)
         
-        # ПЕНАЛЬТИ: Защита от торговли против рынка
-        if imoex_bullish is False and tech_total > 0:
-            tech_total -= 0.5
-        elif imoex_bullish is True and tech_total < 0:
-            tech_total += 0.5
+        if imoex_bullish is False and tech_total > 0: tech_total -= 0.5
+        elif imoex_bullish is True and tech_total < 0: tech_total += 0.5
 
         return tech_total, trend, row[macd_hist], rsi, vwma_status, imoex_trend, imoex_bullish
 
     def generate_plan(self, data, signal, capital, risk_pct):
         last_close = data['Close'].iloc[-1]
-        
-        # Безопасный поиск колонки ATR
         atr_col = [col for col in data.columns if col.startswith('ATR')][0]
         atr = data[atr_col].iloc[-1]
         if atr <= 0: atr = last_close * 0.02
@@ -168,17 +144,106 @@ class QuantEngine:
 
         return entry, sl, tp1, tp2, pos_size, rr, risk_money
 
+    # === НОВЫЙ МОДУЛЬ: БЭКТЕСТ ===
+    def run_backtest(self, data, imoex_data, initial_capital, risk_pct):
+        capital = initial_capital
+        equity_curve = []
+        trades = []
+        
+        in_position = False
+        trade_type = ""
+        entry_price = 0
+        sl = 0
+        tp = 0
+        pos_size = 0
+        entry_date = None
+        
+        atr_col = [col for col in data.columns if col.startswith('ATR')][0]
+
+        # Для ускорения объединим данные IMOEX с основным датафреймом
+        if imoex_data is not None:
+            merged_data = data.join(imoex_data[['Close', 'EMA_50']], rsuffix='_idx', how='left').ffill()
+        else:
+            merged_data = data.copy()
+
+        # Пропускаем первые 50 дней, пока индикаторы накапливают историю
+        for i in range(50, len(merged_data)):
+            row = merged_data.iloc[i]
+            date = merged_data.index[i]
+            
+            # 1. Проверка выхода из текущей сделки
+            if in_position:
+                exit_price = 0
+                reason = ""
+                if trade_type == "LONG":
+                    if row['Low'] <= sl: exit_price, reason = sl, "Stop Loss"
+                    elif row['High'] >= tp: exit_price, reason = tp, "Take Profit"
+                elif trade_type == "SHORT":
+                    if row['High'] >= sl: exit_price, reason = sl, "Stop Loss"
+                    elif row['Low'] <= tp: exit_price, reason = tp, "Take Profit"
+                        
+                if exit_price != 0:
+                    pnl = (exit_price - entry_price) * pos_size if trade_type == "LONG" else (entry_price - exit_price) * pos_size
+                    capital += pnl
+                    trades.append({
+                        'Вход': entry_date.strftime('%Y-%m-%d'), 'Выход': date.strftime('%Y-%m-%d'), 
+                        'Тип': trade_type, 'Цена входа': round(entry_price, 2), 
+                        'Цена выхода': round(exit_price, 2), 'PnL (₽)': round(pnl, 2), 'Итог': reason
+                    })
+                    in_position = False
+
+            # 2. Проверка входа в новую сделку
+            if not in_position:
+                imoex_row = None
+                if 'Close_idx' in row:
+                    imoex_row = pd.Series({'Close': row['Close_idx'], 'EMA_50': row['EMA_50_idx']})
+                
+                h_score, _, _, _, _, _, _ = self._calculate_signal_for_row(row, imoex_row, data.columns)
+                atr = row[atr_col] if row[atr_col] > 0 else row['Close'] * 0.02
+
+                # Сигналы на вход
+                if h_score > 0.2: # BUY
+                    in_position = True
+                    trade_type = "LONG"
+                    entry_price = row['Close']
+                    sl, tp = entry_price - (atr * 1.5), entry_price + (atr * 2.0)
+                    risk_money = capital * (risk_pct / 100)
+                    risk_per_share = abs(entry_price - sl)
+                    pos_size = int(risk_money / risk_per_share) if risk_per_share > 0 else 0
+                    entry_date = date
+                    
+                elif h_score < -0.2: # SELL
+                    in_position = True
+                    trade_type = "SHORT"
+                    entry_price = row['Close']
+                    sl, tp = entry_price + (atr * 1.5), entry_price - (atr * 2.0)
+                    risk_money = capital * (risk_pct / 100)
+                    risk_per_share = abs(sl - entry_price)
+                    pos_size = int(risk_money / risk_per_share) if risk_per_share > 0 else 0
+                    entry_date = date
+
+            equity_curve.append({'Date': date, 'Capital': capital})
+
+        # Принудительно закрываем сделку в конце теста
+        if in_position:
+            exit_price = merged_data.iloc[-1]['Close']
+            pnl = (exit_price - entry_price) * pos_size if trade_type == "LONG" else (entry_price - exit_price) * pos_size
+            capital += pnl
+            trades.append({
+                'Вход': entry_date.strftime('%Y-%m-%d'), 'Выход': merged_data.index[-1].strftime('%Y-%m-%d'), 
+                'Тип': trade_type, 'Цена входа': round(entry_price, 2), 
+                'Цена выхода': round(exit_price, 2), 'PnL (₽)': round(pnl, 2), 'Итог': "Конец теста"
+            })
+            equity_curve[-1]['Capital'] = capital
+            
+        return pd.DataFrame(equity_curve), pd.DataFrame(trades)
+
 # --- ИНТЕРФЕЙС ---
 with st.sidebar:
     st.title("⚙️ Настройки")
     ticker_input = st.text_input("Тикер актива", value="SBER")
     
-    # Выбор исторического периода
-    period_options = {
-        "1 Год": 365,
-        "3 Года": 1095,
-        "5 Лет": 1825
-    }
+    period_options = {"1 Год": 365, "3 Года": 1095, "5 Лет": 1825}
     selected_period_label = st.selectbox("Исторический период", list(period_options.keys()), index=2)
     days_history = period_options[selected_period_label]
     
@@ -193,7 +258,6 @@ with st.spinner(f'Анализ рыночной структуры за {selecte
     imoex_data = engine.fetch_imoex(days=days_history)
 
 if data is not None:
-    # Динамический поиск нужных колонок
     bb_upper = [col for col in data.columns if col.startswith('BBU')][0]
     bb_lower = [col for col in data.columns if col.startswith('BBL')][0]
     macd_hist_col = [col for col in data.columns if col.startswith('MACDh_')][0]
@@ -206,46 +270,34 @@ if data is not None:
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Цена (₽)", f"{last_close:.2f}", f"{pct_change:.2f}%")
-    col2.metric("След Денег (VWMA)", f"{data[vwma_col].iloc[-1]:.2f}", help="Средневзвешенная по объему цена")
+    col2.metric("След Денег (VWMA)", f"{data[vwma_col].iloc[-1]:.2f}")
     col3.metric("EMA 200 (Глобал)", f"{data['EMA_200'].iloc[-1]:.2f}" if 'EMA_200' in data.columns and data['EMA_200'].iloc[-1] > 0 else "Нет данных")
     col4.metric("Волатильность (ATR)", f"{data[atr_col].iloc[-1]:.2f}")
 
+    # Основной график
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
                         row_heights=[0.6, 0.2, 0.2], subplot_titles=('Цена, Тренд и Объемы (VWMA)', 'MACD (Импульс)', 'RSI'))
 
-    # Отрисовка свечей
     fig.add_trace(go.Candlestick(x=data.index, open=data['Open'], high=data['High'], low=data['Low'], close=data['Close'], name='Цена'), row=1, col=1)
-    
-    # Отрисовка Полос Боллинджера (полупрозрачный канал)
     fig.add_trace(go.Scatter(x=data.index, y=data[bb_upper], line=dict(color='rgba(255, 255, 255, 0.2)', width=1), name='BB Верх'), row=1, col=1)
     fig.add_trace(go.Scatter(x=data.index, y=data[bb_lower], line=dict(color='rgba(255, 255, 255, 0.2)', width=1), fill='tonexty', fillcolor='rgba(255, 255, 255, 0.05)', name='BB Низ'), row=1, col=1)
-
-    # Выделяем VWMA и EMA
-    fig.add_trace(go.Scatter(x=data.index, y=data[vwma_col], line=dict(color='#FFEA00', width=2.5, dash='dot'), name='Крупные деньги (VWMA)'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data.index, y=data[vwma_col], line=dict(color='#FFEA00', width=2.5, dash='dot'), name='VWMA'), row=1, col=1)
     fig.add_trace(go.Scatter(x=data.index, y=data['EMA_20'], line=dict(color='#2962FF', width=1.5), name='EMA 20'), row=1, col=1)
     fig.add_trace(go.Scatter(x=data.index, y=data['EMA_50'], line=dict(color='#FF6D00', width=1.5), name='EMA 50'), row=1, col=1)
 
-    # Индикаторы (MACD, RSI)
     colors_macd = ['#26A69A' if val >= 0 else '#EF5350' for val in data[macd_hist_col]]
     fig.add_trace(go.Bar(x=data.index, y=data[macd_hist_col], marker_color=colors_macd, name='MACD'), row=2, col=1)
-
     fig.add_trace(go.Scatter(x=data.index, y=data['RSI_14'], line=dict(color='#E040FB', width=2), name='RSI'), row=3, col=1)
     fig.add_hline(y=70, line_dash="dash", line_color="rgba(239, 83, 80, 0.5)", row=3, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="rgba(38, 166, 154, 0.5)", row=3, col=1)
 
-    # Настройки отображения графика (скрываем выходные дни)
     fig.update_layout(height=800, template="plotly_dark", hovermode="x unified", margin=dict(l=10, r=10, t=40, b=10))
-    fig.update_xaxes(
-        rangeslider_visible=False,
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]) # Вырезаем субботу и воскресенье
-        ]
-    )
+    fig.update_xaxes(rangeslider_visible=False, rangebreaks=[dict(bounds=["sat", "mon"])])
     st.plotly_chart(fig, use_container_width=True)
 
     tech_score, trend_desc, macd_val, rsi_val, vwma_status, imoex_trend, imoex_bullish = engine.analyze_context(data, imoex_data)
     
-    st.markdown("### 🧠 Радар Хедж-Фонда (Оценка контекста)")
+    st.markdown("### 🧠 Радар Хедж-Фонда")
     c1, c2, c3, c4 = st.columns(4)
     c1.info(f"**Рынок РФ (IMOEX):**\n{imoex_trend}")
     c2.info(f"**Тренд Акции:**\n{trend_desc}")
@@ -258,11 +310,6 @@ if data is not None:
     elif tech_score < -0.2: final_signal = "SELL"
     else: final_signal = "HOLD / НЕ ВХОДИТЬ"
 
-    if imoex_bullish is False and "BUY" in final_signal:
-        st.warning("⚠️ ВНИМАНИЕ: Индекс Мосбиржи сейчас падает! Покупать акцию против рынка ОЧЕНЬ ОПАСНО. Рейтинг сигнала понижен.")
-    if imoex_bullish is True and "SELL" in final_signal:
-        st.warning("⚠️ ВНИМАНИЕ: Весь рынок сейчас растет! Играть на понижение этой акции (Шортить) против рынка ОЧЕНЬ ОПАСНО.")
-
     st.divider()
     st.markdown(f"## 🎯 ТОРГОВЫЙ ПЛАН: <span style='color:{'#26A69A' if 'BUY' in final_signal else '#EF5350' if 'SELL' in final_signal else 'gray'};'>{final_signal}</span>", unsafe_allow_html=True)
 
@@ -272,58 +319,47 @@ if data is not None:
         plan_c1.success(f"**🟢 TAKE PROFIT:**\n\n🎯 Цель 1: **{tp1:.2f} ₽**\n\n🚀 Цель 2: **{tp2:.2f} ₽**")
         plan_c2.warning(f"**🟡 ВХОД И ОБЪЕМ:**\n\nЦена: **{entry:.2f} ₽**\n\nОбъем: **{pos_size} шт.**")
         plan_c3.error(f"**🔴 СТОП-ЛОСС:**\n\nЦена: **{sl:.2f} ₽**\n\nРиск: **-{risk_m:.0f} ₽**")
-        st.markdown(f"**Соотношение Риск/Прибыль (R/R):** 1 к {rr:.1f}")
     else:
-        st.write("На рынке противоречивая ситуация (Например: акция растет, но Индекс падает, или наоборот). Лучшая позиция — просто наблюдать.")
+        st.write("На рынке противоречивая ситуация. Лучшая позиция — просто наблюдать.")
 
-    # --- ИСТОРИЯ СИГНАЛОВ ---
+    # === ИНТЕРФЕЙС БЭКТЕСТА ===
     st.divider()
-    st.markdown("### 📜 История Сигналов (Последние 5 дней)")
-    
-    history_data = []
-    
-    for i in range(1, 6):
-        if len(data) >= i:
-            hist_row = data.iloc[-i]
-            hist_date = data.index[-i].strftime('%d.%m.%Y')
+    with st.expander("🧪 ЗАПУСТИТЬ БЭКТЕСТ (Симуляция стратегии на истории)", expanded=False):
+        st.write(f"Симуляция торговли **{ticker_input}** за выбранный период ({selected_period_label}). Капитал: **{capital} ₽**, Риск на сделку: **{risk_pct}%**.")
+        
+        with st.spinner("Прогоняем историю..."):
+            eq_df, trades_df = engine.run_backtest(data, imoex_data, capital, risk_pct)
+        
+        if not trades_df.empty:
+            final_capital = eq_df['Capital'].iloc[-1]
+            total_return = ((final_capital - capital) / capital) * 100
             
-            hist_imoex_row = None
-            if imoex_data is not None:
-                try:
-                    idx_loc = imoex_data.index.get_indexer([data.index[-i]], method='nearest')[0]
-                    hist_imoex_row = imoex_data.iloc[idx_loc]
-                except Exception:
-                    pass
+            # Статистика
+            win_trades = len(trades_df[trades_df['PnL (₽)'] > 0])
+            total_trades = len(trades_df)
+            win_rate = (win_trades / total_trades) * 100
+            
+            # Максимальная просадка
+            eq_df['Peak'] = eq_df['Capital'].cummax()
+            eq_df['Drawdown'] = (eq_df['Capital'] - eq_df['Peak']) / eq_df['Peak'] * 100
+            max_dd = eq_df['Drawdown'].min()
 
-            h_score, h_trend, h_macd, h_rsi, h_vwma, _, _ = engine._calculate_signal_for_row(hist_row, hist_imoex_row, data.columns)
-            
-            if h_score > 0.6: h_sig = "STRONG BUY 🟢"
-            elif h_score > 0.2: h_sig = "BUY ↗️"
-            elif h_score < -0.6: h_sig = "STRONG SELL 🔴"
-            elif h_score < -0.2: h_sig = "SELL ↘️"
-            else: h_sig = "HOLD ⚖️"
-            
-            history_data.append({
-                "Дата": hist_date,
-                "Цена Закрытия (₽)": f"{hist_row['Close']:.2f}",
-                "Сигнал ИИ": h_sig,
-                "Объемы (VWMA)": h_vwma.split()[0], 
-                "MACD": "Рост 📈" if h_macd > 0 else "Падение 📉",
-                "RSI": f"{h_rsi:.1f}"
-            })
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("Итоговый Капитал", f"{final_capital:,.0f} ₽", f"{total_return:.2f}%")
+            b2.metric("Винрейт (Успешные сделки)", f"{win_rate:.1f}%")
+            b3.metric("Всего сделок", f"{total_trades}")
+            b4.metric("Макс. Просадка", f"{max_dd:.2f}%")
 
-    if history_data:
-        df_history = pd.DataFrame(history_data)
-        st.dataframe(
-            df_history, 
-            hide_index=True, 
-            use_container_width=True,
-            column_config={
-                "Сигнал ИИ": st.column_config.TextColumn(
-                    "Сигнал ИИ",
-                    help="Итоговый торговый сигнал на конец дня"
-                )
-            }
-        )
+            # График Эквити (Кривая капитала)
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(x=eq_df['Date'], y=eq_df['Capital'], fill='tozeroy', line=dict(color='#00E676', width=2), name='Капитал'))
+            fig_eq.update_layout(title="Кривая доходности (Эквити)", template="plotly_dark", height=400, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+            # Таблица сделок
+            st.markdown("### 📋 Журнал сделок")
+            st.dataframe(trades_df.style.map(lambda x: 'color: #00E676;' if x > 0 else 'color: #FF1744;' if x < 0 else '', subset=['PnL (₽)']), use_container_width=True)
+        else:
+            st.warning("За выбранный период стратегия не нашла ни одной точки входа.")
 else:
-    st.error("Не удалось загрузить данные. Проверьте тикер (например, SBER, LKOH) и подключение к сети.")
+    st.error("Не удалось загрузить данные.")
