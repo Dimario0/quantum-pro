@@ -21,7 +21,7 @@ class QuantEngine:
     def __init__(self, ticker):
         self.ticker = ticker.upper().replace(".ME", "").strip()
 
-    def fetch_data(self, days=400):
+    def fetch_data(self, days):
         try:
             with requests.Session() as session:
                 start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
@@ -48,7 +48,7 @@ class QuantEngine:
                 df.ta.atr(length=14, append=True)
                 df.ta.macd(fast=12, slow=26, signal=9, append=True)
                 
-                # НОВОЕ: Индикатор VWMA 20 (След крупных денег по объему)
+                # Индикатор VWMA 20 (След крупных денег по объему)
                 df.ta.vwma(length=20, append=True)
                 
                 df.fillna(0, inplace=True)
@@ -57,12 +57,11 @@ class QuantEngine:
         except Exception:
             return None
 
-    def fetch_imoex(self, days=400):
-        """НОВОЕ: Скрытый радар (Скачивает Индекс Мосбиржи)"""
+    def fetch_imoex(self, days):
+        """Скрытый радар (Скачивает Индекс Мосбиржи)"""
         try:
             with requests.Session() as session:
                 start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-                # Индексы на бирже лежат в режиме торгов SNDX
                 data = apimoex.get_board_history(session, 'IMOEX', start=start_date, board='SNDX', columns=('TRADEDATE', 'CLOSE'))
                 if not data: return None
                 
@@ -77,40 +76,55 @@ class QuantEngine:
             return None
 
     def analyze_context(self, data, imoex_data):
-        """Продвинутая логика хедж-фонда (Мульти-факторная)"""
+        """Продвинутая логика хедж-фонда (Мульти-факторная) - Вызов для последнего дня"""
         last = data.iloc[-1]
-        macd_line = [col for col in data.columns if col.startswith('MACD_')][0]
-        macd_sig = [col for col in data.columns if col.startswith('MACDs_')][0]
-        macd_hist = [col for col in data.columns if col.startswith('MACDh_')][0]
-        vwma = last['VWMA_20']
+        imoex_last = imoex_data.iloc[-1] if imoex_data is not None and len(imoex_data) > 0 else None
+        return self._calculate_signal_for_row(last, imoex_last, data.columns)
+
+    def _calculate_signal_for_row(self, row, imoex_row, columns):
+        """Внутренний метод для расчета сигнала для любой конкретной даты"""
+        macd_line = [col for col in columns if col.startswith('MACD_')][0]
+        macd_sig = [col for col in columns if col.startswith('MACDs_')][0]
+        macd_hist = [col for col in columns if col.startswith('MACDh_')][0]
         
-        # 1. Тренд Акции
-        if last['Close'] > last['EMA_50'] and last['EMA_50'] > last['EMA_200']:
-            trend, t_score = "СИЛЬНЫЙ РОСТ 🐂", 1.0
-        elif last['Close'] < last['EMA_50'] and last['EMA_50'] < last['EMA_200']:
-            trend, t_score = "СИЛЬНОЕ ПАДЕНИЕ 🐻", -1.0
+        # Динамический поиск VWMA
+        vwma_col = [col for col in columns if col.startswith('VWMA')][0]
+        vwma = row[vwma_col]
+        
+        # 1. Тренд Акции (С защитой от новых акций без истории в 200 дней)
+        if 'EMA_200' in row and row['EMA_200'] > 0:
+            if row['Close'] > row['EMA_50'] and row['EMA_50'] > row['EMA_200']:
+                trend, t_score = "СИЛЬНЫЙ РОСТ 🐂", 1.0
+            elif row['Close'] < row['EMA_50'] and row['EMA_50'] < row['EMA_200']:
+                trend, t_score = "СИЛЬНОЕ ПАДЕНИЕ 🐻", -1.0
+            else:
+                trend, t_score = "БОКОВИК / ФЛЭТ ⚖️", 0
         else:
-            trend, t_score = "БОКОВИК / ФЛЭТ ⚖️", 0
+            if row['Close'] > row['EMA_50']:
+                trend, t_score = "ЛОКАЛЬНЫЙ РОСТ 🐂", 0.5
+            elif row['Close'] < row['EMA_50']:
+                trend, t_score = "ЛОКАЛЬНОЕ ПАДЕНИЕ 🐻", -0.5
+            else:
+                trend, t_score = "БОКОВИК / ФЛЭТ ⚖️", 0
 
         # 2. VWMA (Что делают крупные фонды?)
-        if last['Close'] > vwma:
+        if row['Close'] > vwma:
             vwma_status, vwma_score = "ПОКУПАЮТ 🐋", 1.0
         else:
             vwma_status, vwma_score = "РАЗДАЮТ ТОЛПЕ 🦈", -1.0
 
         # 3. Моментум (MACD)
-        mom_score = 1.0 if last[macd_line] > last[macd_sig] and last[macd_hist] > 0 else -1.0
+        mom_score = 1.0 if row[macd_line] > row[macd_sig] and row[macd_hist] > 0 else -1.0
         
         # 4. Перегретость (RSI)
-        rsi = last['RSI_14']
+        rsi = row['RSI_14']
         rsi_score = 0.5 if 40 <= rsi <= 60 else (1.5 if rsi < 35 else -1.5)
 
         # 5. Глобальный рынок (IMOEX)
-        imoex_bullish = True
+        imoex_bullish = None
         imoex_trend = "НЕТ ДАННЫХ"
-        if imoex_data is not None and len(imoex_data) > 0:
-            last_idx = imoex_data.iloc[-1]
-            if last_idx['Close'] > last_idx['EMA_50']:
+        if imoex_row is not None:
+            if imoex_row['Close'] > imoex_row['EMA_50']:
                 imoex_trend = "РАСТЕТ 🟢"
                 imoex_bullish = True
             else:
@@ -121,16 +135,19 @@ class QuantEngine:
         tech_total = (t_score * 0.3) + (mom_score * 0.3) + (vwma_score * 0.3) + (rsi_score * 0.1)
         
         # ПЕНАЛЬТИ: Защита от торговли против рынка
-        if not imoex_bullish and tech_total > 0:
-            tech_total -= 0.5 # Режем рейтинг покупки, если индекс падает
-        elif imoex_bullish and tech_total < 0:
-            tech_total += 0.5 # Смягчаем сигнал на продажу, если рынок растет
+        if imoex_bullish is False and tech_total > 0:
+            tech_total -= 0.5
+        elif imoex_bullish is True and tech_total < 0:
+            tech_total += 0.5
 
-        return tech_total, trend, last[macd_hist], rsi, vwma_status, imoex_trend, imoex_bullish
+        return tech_total, trend, row[macd_hist], rsi, vwma_status, imoex_trend, imoex_bullish
 
     def generate_plan(self, data, signal, capital, risk_pct):
         last_close = data['Close'].iloc[-1]
-        atr = data['ATRr_14'].iloc[-1]
+        
+        # Безопасный поиск колонки ATR
+        atr_col = [col for col in data.columns if col.startswith('ATR')][0]
+        atr = data[atr_col].iloc[-1]
         if atr <= 0: atr = last_close * 0.02
 
         if "BUY" in signal:
@@ -155,20 +172,33 @@ class QuantEngine:
 with st.sidebar:
     st.title("⚙️ Настройки")
     ticker_input = st.text_input("Тикер актива", value="SBER")
+    
+    # Выбор исторического периода
+    period_options = {
+        "1 Год": 365,
+        "3 Года": 1095,
+        "5 Лет": 1825
+    }
+    selected_period_label = st.selectbox("Исторический период", list(period_options.keys()), index=2)
+    days_history = period_options[selected_period_label]
+    
     capital = st.number_input("Депозит (₽)", value=100000, step=10000)
     risk_pct = st.slider("Риск (%)", 0.5, 5.0, 1.5)
 
 st.title(f"⚡ QUANTUM ALGO: {ticker_input.upper()}")
 
 engine = QuantEngine(ticker_input)
-with st.spinner('Анализ рыночной структуры и сканирование Индекса...'):
-    data = engine.fetch_data()
-    imoex_data = engine.fetch_imoex()
+with st.spinner(f'Анализ рыночной структуры за {selected_period_label} и сканирование Индекса...'):
+    data = engine.fetch_data(days=days_history)
+    imoex_data = engine.fetch_imoex(days=days_history)
 
 if data is not None:
+    # Динамический поиск нужных колонок
     bb_upper = [col for col in data.columns if col.startswith('BBU')][0]
     bb_lower = [col for col in data.columns if col.startswith('BBL')][0]
     macd_hist_col = [col for col in data.columns if col.startswith('MACDh_')][0]
+    vwma_col = [col for col in data.columns if col.startswith('VWMA')][0]
+    atr_col = [col for col in data.columns if col.startswith('ATR')][0]
 
     last_close = data['Close'].iloc[-1]
     prev_close = data['Close'].iloc[-2]
@@ -176,20 +206,26 @@ if data is not None:
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Цена (₽)", f"{last_close:.2f}", f"{pct_change:.2f}%")
-    col2.metric("След Денег (VWMA)", f"{data['VWMA_20'].iloc[-1]:.2f}", help="Средневзвешенная по объему цена")
-    col3.metric("EMA 200 (Глобал)", f"{data['EMA_200'].iloc[-1]:.2f}")
-    col4.metric("Волатильность (ATR)", f"{data['ATRr_14'].iloc[-1]:.2f}")
+    col2.metric("След Денег (VWMA)", f"{data[vwma_col].iloc[-1]:.2f}", help="Средневзвешенная по объему цена")
+    col3.metric("EMA 200 (Глобал)", f"{data['EMA_200'].iloc[-1]:.2f}" if 'EMA_200' in data.columns and data['EMA_200'].iloc[-1] > 0 else "Нет данных")
+    col4.metric("Волатильность (ATR)", f"{data[atr_col].iloc[-1]:.2f}")
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
                         row_heights=[0.6, 0.2, 0.2], subplot_titles=('Цена, Тренд и Объемы (VWMA)', 'MACD (Импульс)', 'RSI'))
 
+    # Отрисовка свечей
     fig.add_trace(go.Candlestick(x=data.index, open=data['Open'], high=data['High'], low=data['Low'], close=data['Close'], name='Цена'), row=1, col=1)
-    # Выделяем VWMA ярко-желтым пунктиром
-    fig.add_trace(go.Scatter(x=data.index, y=data['VWMA_20'], line=dict(color='#FFEA00', width=2.5, dash='dot'), name='Крупные деньги (VWMA)'), row=1, col=1)
     
+    # Отрисовка Полос Боллинджера (полупрозрачный канал)
+    fig.add_trace(go.Scatter(x=data.index, y=data[bb_upper], line=dict(color='rgba(255, 255, 255, 0.2)', width=1), name='BB Верх'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data.index, y=data[bb_lower], line=dict(color='rgba(255, 255, 255, 0.2)', width=1), fill='tonexty', fillcolor='rgba(255, 255, 255, 0.05)', name='BB Низ'), row=1, col=1)
+
+    # Выделяем VWMA и EMA
+    fig.add_trace(go.Scatter(x=data.index, y=data[vwma_col], line=dict(color='#FFEA00', width=2.5, dash='dot'), name='Крупные деньги (VWMA)'), row=1, col=1)
     fig.add_trace(go.Scatter(x=data.index, y=data['EMA_20'], line=dict(color='#2962FF', width=1.5), name='EMA 20'), row=1, col=1)
     fig.add_trace(go.Scatter(x=data.index, y=data['EMA_50'], line=dict(color='#FF6D00', width=1.5), name='EMA 50'), row=1, col=1)
 
+    # Индикаторы (MACD, RSI)
     colors_macd = ['#26A69A' if val >= 0 else '#EF5350' for val in data[macd_hist_col]]
     fig.add_trace(go.Bar(x=data.index, y=data[macd_hist_col], marker_color=colors_macd, name='MACD'), row=2, col=1)
 
@@ -197,8 +233,14 @@ if data is not None:
     fig.add_hline(y=70, line_dash="dash", line_color="rgba(239, 83, 80, 0.5)", row=3, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="rgba(38, 166, 154, 0.5)", row=3, col=1)
 
-    fig.update_layout(height=700, template="plotly_dark", hovermode="x unified", margin=dict(l=10, r=10, t=40, b=10))
-    fig.update_xaxes(rangeslider_visible=False)
+    # Настройки отображения графика (скрываем выходные дни)
+    fig.update_layout(height=800, template="plotly_dark", hovermode="x unified", margin=dict(l=10, r=10, t=40, b=10))
+    fig.update_xaxes(
+        rangeslider_visible=False,
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]) # Вырезаем субботу и воскресенье
+        ]
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     tech_score, trend_desc, macd_val, rsi_val, vwma_status, imoex_trend, imoex_bullish = engine.analyze_context(data, imoex_data)
@@ -216,9 +258,9 @@ if data is not None:
     elif tech_score < -0.2: final_signal = "SELL"
     else: final_signal = "HOLD / НЕ ВХОДИТЬ"
 
-    if not imoex_bullish and "BUY" in final_signal:
+    if imoex_bullish is False and "BUY" in final_signal:
         st.warning("⚠️ ВНИМАНИЕ: Индекс Мосбиржи сейчас падает! Покупать акцию против рынка ОЧЕНЬ ОПАСНО. Рейтинг сигнала понижен.")
-    if imoex_bullish and "SELL" in final_signal:
+    if imoex_bullish is True and "SELL" in final_signal:
         st.warning("⚠️ ВНИМАНИЕ: Весь рынок сейчас растет! Играть на понижение этой акции (Шортить) против рынка ОЧЕНЬ ОПАСНО.")
 
     st.divider()
@@ -233,5 +275,55 @@ if data is not None:
         st.markdown(f"**Соотношение Риск/Прибыль (R/R):** 1 к {rr:.1f}")
     else:
         st.write("На рынке противоречивая ситуация (Например: акция растет, но Индекс падает, или наоборот). Лучшая позиция — просто наблюдать.")
+
+    # --- ИСТОРИЯ СИГНАЛОВ ---
+    st.divider()
+    st.markdown("### 📜 История Сигналов (Последние 5 дней)")
+    
+    history_data = []
+    
+    for i in range(1, 6):
+        if len(data) >= i:
+            hist_row = data.iloc[-i]
+            hist_date = data.index[-i].strftime('%d.%m.%Y')
+            
+            hist_imoex_row = None
+            if imoex_data is not None:
+                try:
+                    idx_loc = imoex_data.index.get_indexer([data.index[-i]], method='nearest')[0]
+                    hist_imoex_row = imoex_data.iloc[idx_loc]
+                except Exception:
+                    pass
+
+            h_score, h_trend, h_macd, h_rsi, h_vwma, _, _ = engine._calculate_signal_for_row(hist_row, hist_imoex_row, data.columns)
+            
+            if h_score > 0.6: h_sig = "STRONG BUY 🟢"
+            elif h_score > 0.2: h_sig = "BUY ↗️"
+            elif h_score < -0.6: h_sig = "STRONG SELL 🔴"
+            elif h_score < -0.2: h_sig = "SELL ↘️"
+            else: h_sig = "HOLD ⚖️"
+            
+            history_data.append({
+                "Дата": hist_date,
+                "Цена Закрытия (₽)": f"{hist_row['Close']:.2f}",
+                "Сигнал ИИ": h_sig,
+                "Объемы (VWMA)": h_vwma.split()[0], 
+                "MACD": "Рост 📈" if h_macd > 0 else "Падение 📉",
+                "RSI": f"{h_rsi:.1f}"
+            })
+
+    if history_data:
+        df_history = pd.DataFrame(history_data)
+        st.dataframe(
+            df_history, 
+            hide_index=True, 
+            use_container_width=True,
+            column_config={
+                "Сигнал ИИ": st.column_config.TextColumn(
+                    "Сигнал ИИ",
+                    help="Итоговый торговый сигнал на конец дня"
+                )
+            }
+        )
 else:
-    st.error("Не удалось загрузить данные. Проверьте тикер (например, SBER, LKOH).")
+    st.error("Не удалось загрузить данные. Проверьте тикер (например, SBER, LKOH) и подключение к сети.")
