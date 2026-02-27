@@ -7,7 +7,6 @@ import requests
 import apimoex
 from datetime import datetime, timedelta
 
-# --- КОНФИГУРАЦИЯ СТРАНИЦЫ ---
 st.set_page_config(page_title="QUANTUM TRADER PRO", layout="wide", page_icon="🇷🇺")
 
 st.markdown("""
@@ -17,7 +16,6 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# Кэшируем данные, чтобы приложение летало
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_data(ticker, days):
     try:
@@ -36,9 +34,8 @@ def fetch_stock_data(ticker, days):
             df.set_index('Date', inplace=True)
             df.sort_index(inplace=True)
             
-            if len(df) < 20: return None # Минимум 20 дней для расчетов
+            if len(df) < 20: return None
 
-            # Безопасный расчет индикаторов (не крашится на молодых акциях)
             try: df.ta.ema(length=20, append=True)
             except: pass
             try: df.ta.ema(length=50, append=True)
@@ -76,6 +73,8 @@ def fetch_context_data(days):
                 df_idx.rename(columns={'TRADEDATE': 'Date', 'CLOSE': 'Close'}, inplace=True)
                 df_idx['Date'] = pd.to_datetime(df_idx['Date'])
                 df_idx.set_index('Date', inplace=True)
+                # Считаем тренд Индекса Мосбиржи
+                df_idx.ta.ema(length=50, append=True)
                 
             if df_usd is not None and not df_usd.empty:
                 df_usd.columns = [str(c).upper() for c in df_usd.columns]
@@ -87,59 +86,116 @@ def fetch_context_data(days):
     except:
         return None, None
 
-def run_backtest(data, initial_cap, risk_pct):
+def run_advanced_backtest(data, df_idx, initial_cap, risk_pct):
+    """Продвинутый бэктест: Режим рынка, Шорт, Трейлинг стоп и Комиссии"""
     cap = initial_cap
     trades = []
     equity = [initial_cap] * min(50, len(data))
+    
     in_pos = False
+    pos_type = None # 'LONG' или 'SHORT'
+    entry_p = 0
+    pos_size = 0
     
     macd_h = [c for c in data.columns if c.startswith('MACDh')]
     vwma = [c for c in data.columns if c.startswith('VWMA')]
     atr_col = [c for c in data.columns if c.startswith('ATR')]
     
-    # Если нужных индикаторов нет, отменяем бэктест во избежание ошибки
     if not macd_h or not vwma or not atr_col or 'EMA_50' not in data.columns:
-        return equity, pd.DataFrame(columns=['Дата', 'PnL', 'Итог'])
+        return equity, pd.DataFrame(columns=['Дата', 'Тип', 'Вход', 'Выход', 'PnL', 'Итог'])
 
     mh, vw, atr = macd_h[0], vwma[0], atr_col[0]
+    commission_rate = 0.0005 # 0.05% комиссия брокера
+
+    # Синхронизируем данные Индекса с акцией
+    if df_idx is not None and 'EMA_50' in df_idx.columns:
+        idx_trend = df_idx['Close'] > df_idx['EMA_50']
+        data['Bull_Market'] = idx_trend.reindex(data.index).ffill()
+    else:
+        data['Bull_Market'] = True
 
     for i in range(50, len(data)):
         row = data.iloc[i]
+        bull_market = row['Bull_Market']
         
-        if not in_pos and row['Close'] > row['EMA_50'] and row[mh] > 0 and row['Close'] > row[vw]:
-            in_pos = True
-            entry_p = row['Close']
-            sl = entry_p - (row[atr] * 2)
-            tp = entry_p + (row[atr] * 4)
-            
-            risk_rub = cap * (risk_pct / 100)
-            pos_size = int(risk_rub / abs(entry_p - sl)) if abs(entry_p - sl) > 0 else 0
-            entry_date = data.index[i]
+        # --- ЛОГИКА ВХОДА ---
+        if not in_pos:
+            # СИГНАЛ LONG: Рынок растет, Тренд акции вверх, Импульс +, Объемы +
+            if bull_market and row['Close'] > row['EMA_50'] and row[mh] > 0 and row['Close'] > row[vw]:
+                in_pos = True
+                pos_type = 'LONG'
+                entry_p = row['Close']
+                sl = entry_p - (row[atr] * 2.5) # Даем больше пространства для "дыхания"
+                
+                risk_rub = cap * (risk_pct / 100)
+                pos_size = int(risk_rub / abs(entry_p - sl)) if abs(entry_p - sl) > 0 else 0
+                cap -= (entry_p * pos_size * commission_rate) # Списываем комиссию за вход
+                entry_date = data.index[i]
 
+            # СИГНАЛ SHORT: Рынок падает, Тренд акции вниз, Импульс -, Объемы продают
+            elif not bull_market and row['Close'] < row['EMA_50'] and row[mh] < 0 and row['Close'] < row[vw]:
+                in_pos = True
+                pos_type = 'SHORT'
+                entry_p = row['Close']
+                sl = entry_p + (row[atr] * 2.5)
+                
+                risk_rub = cap * (risk_pct / 100)
+                pos_size = int(risk_rub / abs(sl - entry_p)) if abs(sl - entry_p) > 0 else 0
+                cap -= (entry_p * pos_size * commission_rate)
+                entry_date = data.index[i]
+
+        # --- ЛОГИКА ВЫХОДА (Трейлинг стоп) ---
         elif in_pos:
-            if row['Low'] <= sl or row['High'] >= tp or i == len(data)-1:
-                exit_p = sl if row['Low'] <= sl else (tp if row['High'] >= tp else row['Close'])
-                pnl = (exit_p - entry_p) * pos_size
-                cap += pnl
-                trades.append({'Дата': entry_date.strftime('%Y-%m-%d'), 'PnL': pnl, 'Итог': 'TP 🟢' if exit_p >= tp else 'SL 🔴'})
-                in_pos = False
+            exit_p = 0
+            reason = ""
+            
+            if pos_type == 'LONG':
+                # Выход если сработал жесткий стоп ИЛИ цена пробила быструю EMA_20 вниз (слом тренда)
+                if row['Low'] <= sl:
+                    exit_p, reason = sl, "Stop Loss 🔴"
+                elif row['Close'] < row['EMA_20']:
+                    exit_p, reason = row['Close'], "Trend Exit 🟡"
+                    
+                if exit_p > 0 or i == len(data)-1:
+                    exit_p = exit_p if exit_p > 0 else row['Close']
+                    gross_pnl = (exit_p - entry_p) * pos_size
+                    comm = exit_p * pos_size * commission_rate
+                    net_pnl = gross_pnl - comm
+                    cap += gross_pnl - comm # Возвращаем капитал с учетом PnL и комиссии выхода
+                    trades.append({'Дата': data.index[i].strftime('%Y-%m-%d'), 'Тип': 'LONG 🟢', 'Вход': entry_p, 'Выход': exit_p, 'PnL': net_pnl, 'Итог': reason})
+                    in_pos = False
+
+            elif pos_type == 'SHORT':
+                if row['High'] >= sl:
+                    exit_p, reason = sl, "Stop Loss 🔴"
+                elif row['Close'] > row['EMA_20']:
+                    exit_p, reason = row['Close'], "Trend Exit 🟡"
+                    
+                if exit_p > 0 or i == len(data)-1:
+                    exit_p = exit_p if exit_p > 0 else row['Close']
+                    gross_pnl = (entry_p - exit_p) * pos_size # В шорте прибыль, когда цена падает
+                    comm = exit_p * pos_size * commission_rate
+                    net_pnl = gross_pnl - comm
+                    cap += gross_pnl - comm
+                    trades.append({'Дата': data.index[i].strftime('%Y-%m-%d'), 'Тип': 'SHORT 🔴', 'Вход': entry_p, 'Выход': exit_p, 'PnL': net_pnl, 'Итог': reason})
+                    in_pos = False
         
         equity.append(cap)
         
-    return equity, pd.DataFrame(trades, columns=['Дата', 'PnL', 'Итог'])
+    return equity, pd.DataFrame(trades, columns=['Дата', 'Тип', 'Вход', 'Выход', 'PnL', 'Итог'])
 
 # --- ИНТЕРФЕЙС ---
 with st.sidebar:
     st.title("⚙️ Настройки")
     ticker = st.text_input("Тикер (MOEX)", value="SBER").upper().strip()
-    period = st.selectbox("История", ["1 Год", "3 Года", "5 Лет"], index=0)
+    period = st.selectbox("История", ["1 Год", "3 Года", "5 Лет"], index=2)
     days_map = {"1 Год": 365, "3 Года": 1095, "5 Лет": 1825}
     
     st.divider()
     capital = st.number_input("Начальный депозит (₽)", value=100000, step=10000)
     risk = st.slider("Риск на сделку (%)", 0.5, 5.0, 1.5)
 
-with st.spinner('Синхронизация с серверами MOEX...'):
+with st.spinner('Анализ рыночных режимов...'):
     df_stock = fetch_stock_data(ticker, days_map[period])
     df_idx, df_usd = fetch_context_data(days_map[period])
 
@@ -150,29 +206,33 @@ if df_stock is not None and not df_stock.empty:
     vw = [c for c in df_stock.columns if c.startswith('VWMA')]
     atr_col = [c for c in df_stock.columns if c.startswith('ATR')]
     
-    score = sum([
-        1 if 'EMA_50' in df_stock.columns and last['Close'] > last['EMA_50'] else 0,
-        1 if mh and last[mh[0]] > 0 else 0,
-        1 if vw and last['Close'] > last[vw[0]] else 0
-    ])
+    bull_market = True
+    if df_idx is not None and 'EMA_50' in df_idx.columns:
+        bull_market = df_idx.iloc[-1]['Close'] > df_idx.iloc[-1]['EMA_50']
+    
+    # Расчет статуса
+    if bull_market and last['Close'] > last['EMA_50'] and mh and last[mh[0]] > 0 and vw and last['Close'] > last[vw[0]]:
+        signal = "STRONG BUY 🟢"
+    elif not bull_market and last['Close'] < last['EMA_50'] and mh and last[mh[0]] < 0 and vw and last['Close'] < last[vw[0]]:
+        signal = "STRONG SHORT 🔴"
+    else:
+        signal = "HOLD / CASH ⚖️"
     
     # 1. МЕТРИКИ
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Цена Акции", f"{last['Close']:.2f} ₽")
-    if df_usd is not None and not df_usd.empty: 
-        m2.metric("USD/RUB", f"{df_usd.iloc[-1]['Close']:.2f} ₽")
-    else:
-        m2.metric("USD/RUB", "Нет данных")
-        
+    m2.metric("Режим Рынка (IMOEX)", "БЫЧИЙ 🐂" if bull_market else "МЕДВЕЖИЙ 🐻")
     m3.metric("Крупный капитал", "АНОМАЛИЯ 🐳" if last['Anomaly'] else "Норма")
-    m4.metric("Торговый Сигнал", "STRONG BUY 🚀" if score == 3 else "HOLD ⚖️" if score > 1 else "SELL 🐻")
+    m4.metric("Торговый Сигнал", signal)
 
     # 2. ГРАФИК
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     
     fig.add_trace(go.Candlestick(x=df_stock.index, open=df_stock['Open'], high=df_stock['High'], low=df_stock['Low'], close=df_stock['Close'], name='Цена'), row=1, col=1)
     if 'EMA_50' in df_stock.columns:
-        fig.add_trace(go.Scatter(x=df_stock.index, y=df_stock['EMA_50'], line=dict(color='#FF6D00', width=1.5), name='EMA 50'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_stock.index, y=df_stock['EMA_50'], line=dict(color='#FF6D00', width=1.5), name='EMA 50 (Тренд)'), row=1, col=1)
+    if 'EMA_20' in df_stock.columns:
+        fig.add_trace(go.Scatter(x=df_stock.index, y=df_stock['EMA_20'], line=dict(color='#2962FF', width=1.5, dash='dot'), name='EMA 20 (Выход)'), row=1, col=1)
     
     anomalies = df_stock[df_stock['Anomaly']]
     fig.add_trace(go.Scatter(x=anomalies.index, y=anomalies['High']*1.02, mode='markers', marker=dict(color='#00E5FF', size=8, symbol='diamond'), name='Всплеск объема'), row=1, col=1)
@@ -184,46 +244,22 @@ if df_stock is not None and not df_stock.empty:
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     st.plotly_chart(fig, use_container_width=True)
 
-    # 3. ПЛАН И КНОПКА СОХРАНЕНИЯ
-    st.subheader("🎯 Актуальный план:")
-    plan_col, save_col = st.columns([3, 1])
-    
-    with plan_col:
-        if score == 3 and atr_col:
-            st.success(f"**🟢 ВХОД:** {last['Close']:.2f} ₽ &nbsp;|&nbsp; **🔴 СТОП-ЛОСС:** {last['Close'] - last[atr_col[0]]*2:.2f} ₽ &nbsp;|&nbsp; **🚀 ТЕЙК-ПРОФИТ:** {last['Close'] + last[atr_col[0]]*4:.2f} ₽")
-        else:
-            st.info("💡 Условия для идеального входа сейчас не выполнены. Ждем подтверждения тренда и объемов.")
-            
-    with save_col:
-        # Вот функционал выгрузки и сохранения
-        csv = df_stock.to_csv().encode('utf-8')
-        st.download_button(
-            label="💾 Скачать данные (CSV)", 
-            data=csv, 
-            file_name=f"{ticker}_quantum_data.csv", 
-            mime="text/csv", 
-            use_container_width=True
-        )
-
-    # 4. БЭКТЕСТ
+    # 3. БЭКТЕСТ (Открыт по умолчанию для наглядности)
     st.divider()
-    with st.expander("🧪 РЕЗУЛЬТАТЫ БЭКТЕСТА (Симуляция стратегии)", expanded=False):
-        equity, trades = run_backtest(df_stock, capital, risk)
-        
-        b_col1, b_col2, b_col3 = st.columns(3)
-        final_profit = equity[-1] - capital
-        b_col1.metric("Чистая прибыль", f"{final_profit:,.0f} ₽", f"{(final_profit/capital)*100:.1f}%")
-        b_col2.metric("Всего сделок", len(trades))
-        
-        if len(trades) > 0:
-            winrate = (len(trades[trades['PnL'] > 0]) / len(trades)) * 100
-            b_col3.metric("Успешных сделок", f"{winrate:.1f}%")
-        else:
-            b_col3.metric("Успешных сделок", "0%")
-        
-        st.line_chart(equity)
-        if not trades.empty:
-            st.dataframe(trades.style.map(lambda x: 'color: #00E676;' if x > 0 else 'color: #FF1744;' if x < 0 else '', subset=['PnL']), use_container_width=True)
-
-else:
-    st.error("❌ Ошибка загрузки. Убедитесь, что тикер введен верно (например, SBER) и биржа не проводит тех. работы.")
+    st.subheader("🧪 РЕЗУЛЬТАТЫ БЭКТЕСТА (Long & Short + Комиссии)")
+    equity, trades = run_advanced_backtest(df_stock, df_idx, capital, risk)
+    
+    b_col1, b_col2, b_col3, b_col4 = st.columns(4)
+    final_profit = equity[-1] - capital
+    b_col1.metric("Чистая прибыль", f"{final_profit:,.0f} ₽", f"{(final_profit/capital)*100:.1f}%")
+    b_col2.metric("Всего сделок", len(trades))
+    
+    if len(trades) > 0:
+        winrate = (len(trades[trades['PnL'] > 0]) / len(trades)) * 100
+        long_trades = len(trades[trades['Тип'] == 'LONG 🟢'])
+        short_trades = len(trades[trades['Тип'] == 'SHORT 🔴'])
+        b_col3.metric("Винрейт", f"{winrate:.1f}%")
+        b_col4.metric("Лонг / Шорт", f"{long_trades} / {short_trades}")
+    else:
+        b_col3.metric("Винрейт", "0%")
+        b_col4.metric("Лонг / Шорт", "
